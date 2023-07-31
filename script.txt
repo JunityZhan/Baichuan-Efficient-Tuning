@@ -1,0 +1,21 @@
+CUDA_VISIBLE_DEVICES=0 python src/train_bash.py \
+    --stage pt \
+    --model_name_or_path baichuan-inc/Baichuan-13B-Chat \
+    --do_train \
+    --dataset genshin_wiki \
+    --finetuning_type lora \
+    --output_dir ./outputs \
+    --overwrite_cache \
+    --per_device_train_batch_size 16 \
+    --gradient_accumulation_steps 64 \
+    --lr_scheduler_type cosine \
+    --logging_steps 5 \
+    --save_steps 20 \
+    --learning_rate 5e-5 \
+    --num_train_epochs 3.0 \
+    --plot_loss \
+    --fp16 \
+    --prompt_template baichuan \
+    --lora_target W_pack,o_proj
+    --lora_rank 16 \
+    --lora_dropout 0.1

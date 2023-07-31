@@ -198,6 +198,15 @@
       "history": ""
     }
   },
+  "genshini_wiki": {
+    "file_name": "genshin_wiki.txt",
+    "columns": {
+      "prompt": "text",
+      "query": "",
+      "response": "",
+      "history": ""
+    }
+  },
   "refinedweb": {
     "hf_hub_url": "tiiuae/falcon-refinedweb",
     "columns": {
