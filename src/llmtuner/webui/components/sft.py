@@ -1,16 +1,18 @@
-from typing import Dict
+from typing import TYPE_CHECKING, Dict
 from transformers.trainer_utils import SchedulerType
 
 import gradio as gr
-from gradio.components import Component
 
 from llmtuner.webui.common import list_dataset, DEFAULT_DATA_DIR
 from llmtuner.webui.components.data import create_preview_box
-from llmtuner.webui.runner import Runner
 from llmtuner.webui.utils import can_preview, get_preview, gen_plot
 
+if TYPE_CHECKING:
+    from gradio.components import Component
+    from llmtuner.webui.runner import Runner
 
-def create_sft_tab(top_elems: Dict[str, Component], runner: Runner) -> Dict[str, Component]:
+
+def create_sft_tab(top_elems: Dict[str, "Component"], runner: "Runner") -> Dict[str, "Component"]:
     with gr.Row():
         dataset_dir = gr.Textbox(value=DEFAULT_DATA_DIR, scale=2)
         dataset = gr.Dropdown(multiselect=True, scale=4)
@@ -56,7 +58,7 @@ def create_sft_tab(top_elems: Dict[str, Component], runner: Runner) -> Dict[str,
         stop_btn = gr.Button()
 
     with gr.Row():
-        with gr.Column(scale=4):
+        with gr.Column(scale=3):
             output_dir = gr.Textbox()
 
             with gr.Box():

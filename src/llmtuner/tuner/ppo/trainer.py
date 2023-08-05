@@ -2,20 +2,23 @@ import os
 import math
 import torch
 from tqdm import tqdm
-from typing import Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
-from transformers import Seq2SeqTrainingArguments, TrainerState, TrainerControl
-from transformers.modeling_utils import PreTrainedModel
+from transformers import TrainerState, TrainerControl
 
 from trl import PPOTrainer
 from trl.core import LengthSampler
 
-from llmtuner.extras.callbacks import LogCallback
 from llmtuner.extras.logging import get_logger
-from llmtuner.extras.misc import AverageMeter, get_logits_processor
-from llmtuner.hparams import FinetuningArguments
+from llmtuner.extras.misc import AverageMeter, count_parameters, get_logits_processor
 from llmtuner.tuner.core.trainer import PeftTrainer
 from llmtuner.tuner.ppo.utils import cast_layernorm_dtype, replace_model
+
+if TYPE_CHECKING:
+    from transformers import Seq2SeqTrainingArguments
+    from trl import AutoModelForCausalLMWithValueHead
+    from llmtuner.extras.callbacks import LogCallback
+    from llmtuner.hparams import FinetuningArguments
 
 
 logger = get_logger(__name__)
@@ -25,11 +28,12 @@ class PPOPeftTrainer(PPOTrainer, PeftTrainer):
     r"""
     Inherits PPOTrainer.
     """
+
     def __init__(
         self,
-        training_args: Seq2SeqTrainingArguments,
-        finetuning_args: FinetuningArguments,
-        callbacks: List[LogCallback],
+        training_args: "Seq2SeqTrainingArguments",
+        finetuning_args: "FinetuningArguments",
+        callbacks: List["LogCallback"],
         **kwargs
     ):
         PPOTrainer.__init__(self, **kwargs)
@@ -38,7 +42,6 @@ class PPOPeftTrainer(PPOTrainer, PeftTrainer):
         self.log_callback = callbacks[0]
         self.state = TrainerState()
         self.control = TrainerControl()
-        self.data_collator = self.accelerator.prepare(kwargs["data_collator"]) # override the data collator of PPOTrainer
         self._remove_log()
 
     def ppo_train(self, max_target_length: int) -> None:
@@ -66,7 +69,7 @@ class PPOPeftTrainer(PPOTrainer, PeftTrainer):
             logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size}")
             logger.info(f"  Gradient Accumulation steps = {self.args.gradient_accumulation_steps}")
             logger.info(f"  Total optimization steps = {max_steps}")
-            logger.info(f"  Number of trainable parameters = {sum(p.numel() for p in self.model.parameters() if p.requires_grad)}")
+            logger.info(f"  Number of trainable parameters = {count_parameters(self.model)[0]}")
 
         # Keyword arguments for `model.generate`
         gen_kwargs = {
@@ -78,7 +81,7 @@ class PPOPeftTrainer(PPOTrainer, PeftTrainer):
             "logits_processor": get_logits_processor()
         }
         length_sampler = LengthSampler(max_target_length // 2, max_target_length)
-        unwrapped_model: PreTrainedModel = self.accelerator.unwrap_model(self.model)
+        unwrapped_model: "AutoModelForCausalLMWithValueHead" = self.accelerator.unwrap_model(self.model)
 
         dataiter = iter(self.dataloader)
         steps_trained = 0
@@ -86,51 +89,38 @@ class PPOPeftTrainer(PPOTrainer, PeftTrainer):
         reward_meter = AverageMeter()
         self.log_callback.on_train_begin(self.args, self.state, self.control)
 
-        for step in tqdm(range(max_steps), disable=not self.is_world_process_zero(), leave=False):
+        for step in tqdm(range(max_steps), disable=not self.is_local_process_zero()):
             batch = next(dataiter)
             steps_trained += 1
 
+            # Cast to inference mode
             unwrapped_model.gradient_checkpointing_disable()
             unwrapped_model.config.use_cache = True
 
-            # Get responses
-            query_tensors = batch["input_ids"]
-            response_tensors = self.generate(batch, length_sampler, return_prompt=False, **gen_kwargs)
+            # Get inputs
+            queries, responses = self.get_inputs(batch, length_sampler, **gen_kwargs)
+            rewards = self.get_rewards(queries, responses, unwrapped_model)
 
-            queries, responses = [], []
-            for i in range(len(query_tensors)):
-                query_length = (query_tensors[i] != self.tokenizer.pad_token_id).nonzero()[0]
-                response_length = (response_tensors[i] != self.tokenizer.pad_token_id).nonzero()[-1] + 1
-                queries.append(query_tensors[i, query_length:]) # remove padding from left
-                responses.append(response_tensors[i, :response_length]) # remove padding from right
-
-            # Compute rewards
-            replace_model(unwrapped_model, target="reward")
-            with torch.no_grad():
-                _, _, values = self.model(
-                    **self.prepare_model_inputs(queries, responses),
-                    output_hidden_states=True,
-                    return_dict=True
-                )
-            rewards = [reward for reward in values[:, -1].to(torch.float32)] # use float32 type
-            replace_model(unwrapped_model, target="default")
-
-            # Run PPO step
+            # Cast to training mode
             unwrapped_model.gradient_checkpointing_enable()
             unwrapped_model.config.use_cache = False
-            stats = self.step(queries, responses, rewards)
 
+            # Run PPO step
+            stats = self.step(queries, responses, rewards)
             loss_meter.update(stats["ppo/loss/total"], n=len(rewards))
             reward_meter.update(torch.stack(rewards).mean().item(), n=len(rewards))
 
-            if self.is_world_process_zero() and (step+1) % self.args.logging_steps == 0:
+            self.state.global_step += 1
+            self.log_callback.on_step_end(self.args, self.state, self.control)
+
+            if self.is_local_process_zero() and (step+1) % self.args.logging_steps == 0:
                 logs = dict(
                     loss=round(loss_meter.avg, 4),
                     reward=round(reward_meter.avg, 4),
                     learning_rate=stats["ppo/learning_rate"],
                     epoch=round(step / len_dataloader, 2)
                 )
-                print(logs)
+                tqdm.write(str(logs))
                 logs["step"] = step
                 self.state.log_history.append(logs)
                 self.log_callback.on_log(self.args, self.state, self.control)
@@ -147,38 +137,57 @@ class PPOPeftTrainer(PPOTrainer, PeftTrainer):
                 dataiter = iter(self.dataloader)
                 steps_trained = 0
 
+        self.log_callback.on_train_end(self.args, self.state, self.control)
+
     @torch.no_grad()
-    def generate(
+    def get_inputs(
         self,
-        inputs: Dict[str, torch.Tensor],
+        batch: Dict[str, torch.Tensor],
         length_sampler: Optional[Callable] = None,
-        return_prompt: Optional[bool] = True,
         **generation_kwargs
-    ) -> torch.Tensor:
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         r"""
         Generates model's responses given queries.
-
-        Subclass and override to inject custom behavior.
         """
-        self.model, layer_norm_params = cast_layernorm_dtype(self.model)
-
         if length_sampler is not None:
             generation_kwargs["max_new_tokens"] = length_sampler()
 
-        unwrapped_model = self.accelerator.unwrap_model(self.model)
-
-        response = unwrapped_model.generate(**inputs, **generation_kwargs)
+        self.model, layer_norm_params = cast_layernorm_dtype(self.model)
+        unwrapped_model: "AutoModelForCausalLMWithValueHead" = self.accelerator.unwrap_model(self.model)
+        response: torch.Tensor = unwrapped_model.generate(**batch, **generation_kwargs)
+        self.model, _ = cast_layernorm_dtype(self.model, layer_norm_params)
 
         # Temporary hack to ensure the generation config is not initialized for each iteration of the evaluation loop
         # Inspired by: https://github.com/huggingface/transformers/blob/v4.28.1/src/transformers/trainer_seq2seq.py#L273
         if unwrapped_model.pretrained_model.generation_config._from_model_config:
             unwrapped_model.pretrained_model.generation_config._from_model_config = False
 
-        self.model, _ = cast_layernorm_dtype(self.model, layer_norm_params)
+        queries, responses = [], []
+        query, response = batch["input_ids"].detach().cpu(), response[:, batch["input_ids"].size(-1):].detach().cpu()
+        for i in range(len(query)):
+            query_length = (query[i] != self.tokenizer.pad_token_id).nonzero()[0]
+            response_length = (response[i] != self.tokenizer.pad_token_id).nonzero()[-1] + 1
+            queries.append(query[i, query_length:]) # remove padding from left
+            responses.append(response[i, :response_length]) # remove padding from right
 
-        if not return_prompt and not self.is_encoder_decoder:
-            return response[:, inputs["input_ids"].size(1):]
-        return response
+        return queries, responses
+
+    @torch.no_grad()
+    def get_rewards(
+        self,
+        queries: List[torch.Tensor],
+        responses: List[torch.Tensor],
+        unwrapped_model: "AutoModelForCausalLMWithValueHead"
+    ) -> List[torch.Tensor]:
+        r"""
+        Computes scores using given reward model.
+        """
+        replace_model(unwrapped_model, target="reward")
+        batch = self.prepare_model_inputs(queries, responses)
+        _, _, values = self.model(**batch, output_hidden_states=True, return_dict=True)
+        rewards = [reward for reward in values[:, -1].float().detach().cpu()] # use fp32 type
+        replace_model(unwrapped_model, target="default")
+        return rewards
 
     def save_model(self, output_dir: Optional[str] = None) -> None:
         r"""

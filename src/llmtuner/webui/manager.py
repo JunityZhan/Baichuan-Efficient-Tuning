@@ -1,6 +1,6 @@
 import gradio as gr
-from typing import Any, Dict, List
 from gradio.components import Component
+from typing import Any, Dict, List
 
 from llmtuner.webui.common import get_model_path, list_dataset, load_config
 from llmtuner.webui.locales import LOCALES
@@ -24,7 +24,7 @@ class Manager:
 
         return refresh_dict
 
-    def gen_label(self, lang: str) -> Dict[Component, dict]:
+    def gen_label(self, lang: str) -> Dict[Component, Dict[str, Any]]: # cannot use TYPE_CHECKING
         update_dict = {}
         refresh_dict = self.gen_refresh()
 
